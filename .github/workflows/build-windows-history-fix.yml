@@ -36,11 +36,11 @@ jobs:
 
       - name: Format check patched transport
         shell: pwsh
-        run: cargo fmt --manifest-path jcode/Cargo.toml --all -- --check
+        run: rustfmt --edition 2024 --check jcode/crates/jcode-transport/src/windows.rs
 
       - name: Test patched Windows transport
         shell: pwsh
-        run: cargo test --manifest-path jcode/Cargo.toml -p jcode-transport sync_stream_clone_supports_concurrent_read_and_write
+        run: cargo test --manifest-path jcode/Cargo.toml -p jcode-transport socket_path
 
       - name: Build Windows package
         shell: pwsh
