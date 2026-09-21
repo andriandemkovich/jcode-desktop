@@ -1,0 +1,61 @@
+name: Build Windows desktop history fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    steps:
+      - name: Checkout desktop
+        uses: actions/checkout@v4
+        with:
+          path: jcode-desktop
+
+      - name: Checkout patched Jcode runtime
+        uses: actions/checkout@v4
+        with:
+          repository: andriandemkovich/jcode
+          ref: fix/windows-desktop-history
+          path: jcode
+          submodules: recursive
+
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Format check patched transport
+        shell: pwsh
+        run: cargo fmt --manifest-path jcode/Cargo.toml --all -- --check
+
+      - name: Test patched Windows transport
+        shell: pwsh
+        run: cargo test --manifest-path jcode/Cargo.toml -p jcode-transport sync_stream_clone_supports_concurrent_read_and_write
+
+      - name: Build Windows package
+        shell: pwsh
+        env:
+          VERSION: 0.3.1-historyfix.1
+          JCODE_REPO: ${{ github.workspace }}/jcode
+          TARGET: x86_64-pc-windows-msvc
+        run: ./jcode-desktop/scripts/package-windows.ps1
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jcode-desktop-windows-history-fix
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            jcode-desktop/dist/windows/Jcode-*.zip
+            jcode-desktop/dist/windows/SHA256SUMS-windows
