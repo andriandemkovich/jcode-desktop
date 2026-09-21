@@ -40,12 +40,12 @@ jobs:
 
       - name: Test patched Windows transport
         shell: pwsh
-        run: cargo test --manifest-path jcode/Cargo.toml -p jcode-transport socket_path
+        run: cargo test --manifest-path jcode/Cargo.toml -p jcode-transport socket_path parked_reader
 
       - name: Build Windows package
         shell: pwsh
         env:
-          VERSION: 0.3.1-historyfix.1
+          VERSION: 0.3.1-historyfix.2
           JCODE_REPO: ${{ github.workspace }}/jcode
           TARGET: x86_64-pc-windows-msvc
         run: ./jcode-desktop/scripts/package-windows.ps1
