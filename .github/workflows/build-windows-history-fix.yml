@@ -40,7 +40,7 @@ jobs:
 
       - name: Test patched Windows transport
         shell: pwsh
-        run: cargo test --manifest-path jcode/Cargo.toml -p jcode-transport socket_path parked_reader
+        run: cargo test --manifest-path jcode/Cargo.toml -p jcode-transport -- socket_path_probe_works_without_a_tokio_runtime a_parked_reader_clone_does_not_block_the_writer
 
       - name: Build Windows package
         shell: pwsh
