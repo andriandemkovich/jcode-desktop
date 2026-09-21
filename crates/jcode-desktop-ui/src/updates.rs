@@ -124,6 +124,15 @@ pub fn ensure_release_check() {
     if *state != ReleaseStatus::Unknown {
         return;
     }
+    // An operator running a locally patched build asked not to be offered
+    // upstream releases: taking one would silently revert their fixes. Report
+    // the running build as current and never reach the network.
+    if std::env::var_os("JCODE_DESKTOP_NO_UPDATE_CHECK").is_some() {
+        *state = ReleaseStatus::Current {
+            latest: env!("JCODE_DESKTOP_VERSION").to_string(),
+        };
+        return;
+    }
     if crate::harness::screenshot_mode() {
         // Offline screenshots must never contact the network.
         *state = fixture_release_status(
@@ -421,6 +430,41 @@ mod tests {
         assert!(
             !CALLED.load(Ordering::Acquire),
             "release check invoked an updater action"
+        );
+        clear_test_actions();
+        set_release_status(ReleaseStatus::Unknown);
+    }
+
+    /// A locally patched install must not be offered an upstream release:
+    /// taking one would silently revert the patches. Opting out reports the
+    /// running build as current without starting any network work.
+    #[test]
+    fn opting_out_reports_the_running_build_and_never_checks() {
+        let _guard = test_lock();
+        static CALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        extern "C" fn unexpected() {
+            CALLED.store(true, Ordering::Release);
+        }
+        unsafe { jcode_update_register_actions(unexpected, unexpected) };
+        set(UpdateState::Idle);
+        set_release_status(ReleaseStatus::Unknown);
+
+        // SAFETY: `test_lock` serializes every test that touches this state.
+        unsafe { std::env::set_var("JCODE_DESKTOP_NO_UPDATE_CHECK", "1") };
+        ensure_release_check();
+        unsafe { std::env::remove_var("JCODE_DESKTOP_NO_UPDATE_CHECK") };
+
+        assert_eq!(
+            release_status(),
+            ReleaseStatus::Current {
+                latest: env!("JCODE_DESKTOP_VERSION").to_string()
+            },
+            "an opted-out build reports itself as current"
+        );
+        assert_eq!(current(), UpdateState::Idle);
+        assert!(
+            !CALLED.load(Ordering::Acquire),
+            "opting out must not invoke an updater action"
         );
         clear_test_actions();
         set_release_status(ReleaseStatus::Unknown);
