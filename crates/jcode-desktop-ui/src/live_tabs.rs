@@ -8,7 +8,9 @@ const TAB_GAP: f32 = 6.0;
 const TAB_HEIGHT: f32 = FOLDER_CONTENT_INSET - TAB_FLOAT_GAP;
 pub(super) const TAB_STATUS_WIDTH: f32 = 88.0;
 const TAB_NEW_WIDTH: f32 = 40.0;
-const TAB_CLOSE_WIDTH: f32 = 40.0;
+/// Minimize plus close. The transparent titlebar hides the platform's own
+/// controls, so both live here and both must be reserved by the tab budget.
+const TAB_CLOSE_WIDTH: f32 = 80.0;
 const TAB_GROUP_LABEL_WIDTH: f32 = 24.0;
 const TAB_GROUP_GAP: f32 = 28.0;
 
@@ -793,6 +795,41 @@ impl Workspace {
             )
             .child(
                 div()
+                    .id("tab-minimize-window")
+                    .debug_selector(|| "tab-minimize-window".into())
+                    .absolute()
+                    .right(px(TAB_HEIGHT))
+                    .top_0()
+                    .size(px(TAB_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .text_size(px(20.0))
+                    .text_color(Theme::global().TEXT_DIM)
+                    .cursor_pointer()
+                    .occlude()
+                    .hover(|el| el.bg(Theme::global().PANEL_BG).text_color(Theme::global().TEXT))
+                    .tooltip(|_, cx| cx.new(|_| TabTooltip("Minimize window".into())).into())
+                    .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                    })
+                    .on_click(|_, window, cx| {
+                        cx.stop_propagation();
+                        // A transparent titlebar hides the platform minimize
+                        // button, so route to the host action that owns the
+                        // native window.
+                        if let Ok(action) =
+                            cx.build_action("jcode_desktop_host::MinimizeWindow", None)
+                        {
+                            window.dispatch_action(action, cx);
+                        }
+                    })
+                    .child("–"),
+            )
+            .child(
+                div()
                     .id("tab-close-window")
                     .debug_selector(|| "tab-close-window".into())
                     .absolute()
@@ -840,7 +877,7 @@ mod action_tests;
 mod tests {
     use super::*;
 
-    gpui::actions!(jcode_desktop_host, [CloseWindow]);
+    gpui::actions!(jcode_desktop_host, [CloseWindow, MinimizeWindow]);
 
     #[gpui::test]
     fn tab_close_window_is_separate_from_new_session_and_dispatches_host_action(
@@ -874,6 +911,56 @@ mod tests {
             assert_eq!(workspace.read_with(vcx, |w, _| w.slots.len()), 1);
         }
         assert_eq!(requests.get(), 3);
+    }
+
+    /// The transparent titlebar hides the platform minimize button, so the tab
+    /// bar owns it. It must sit beside close without overlapping the tabs, and
+    /// it must set the window aside rather than closing it.
+    #[gpui::test]
+    fn tab_minimize_window_sits_beside_close_and_keeps_the_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let minimized = std::rc::Rc::new(std::cell::Cell::new(0));
+        let closed = std::rc::Rc::new(std::cell::Cell::new(0));
+        cx.update({
+            let minimized = minimized.clone();
+            let closed = closed.clone();
+            move |cx| {
+                cx.on_action(move |_: &MinimizeWindow, _| minimized.set(minimized.get() + 1));
+                cx.on_action(move |_: &CloseWindow, _| closed.set(closed.get() + 1));
+            }
+        });
+        let (workspace, vcx) = cx.add_window_view(|_, cx| {
+            let mut w = Workspace::for_test(learning::Coach::new(), cx);
+            w.push_test_panel("Keep this session", cx);
+            w
+        });
+        let handle = vcx.update(|window, _| window.window_handle());
+        for width in [1440., 800., 480.] {
+            vcx.simulate_window_resize(handle, gpui::size(px(width), px(600.)));
+            vcx.run_until_parked();
+            let minimize = vcx.debug_bounds("tab-minimize-window").unwrap();
+            let close = vcx.debug_bounds("tab-close-window").unwrap();
+            let tabs = vcx.debug_bounds("live-session-tabs").unwrap();
+            assert!(
+                minimize.right() <= close.left(),
+                "minimize must not overlap close at {width}px"
+            );
+            assert!(
+                tabs.right() <= minimize.left(),
+                "the tabs must not run under the window controls at {width}px"
+            );
+            assert_eq!(minimize.size, gpui::size(px(TAB_HEIGHT), px(TAB_HEIGHT)));
+            vcx.simulate_click(minimize.center(), gpui::Modifiers::default());
+            vcx.run_until_parked();
+            assert_eq!(
+                workspace.read_with(vcx, |w, _| w.slots.len()),
+                1,
+                "minimizing keeps the open session"
+            );
+        }
+        assert_eq!(minimized.get(), 3);
+        assert_eq!(closed.get(), 0, "minimize must never close the window");
     }
 
     #[test]
