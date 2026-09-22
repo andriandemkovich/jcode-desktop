@@ -46,9 +46,12 @@ jobs:
         shell: pwsh
         run: cargo test --manifest-path jcode-desktop/Cargo.toml -p jcode-desktop-ui -- tab_minimize_window_sits_beside_close_and_keeps_the_workspace tab_close_window_is_separate_from_new_session_and_dispatches_host_action
 
+      # Every module and test the accounts work touches. `--` filters are
+      # substring matches on the full test path, so module prefixes cover the
+      # unit tests and the named ones cover the cross-module UI tests.
       - name: Test Desktop accounts panel
         shell: pwsh
-        run: cargo test --manifest-path jcode-desktop/Cargo.toml -p jcode-desktop-ui -- accounts panel_usage account_switch footer_finds_the_active_claude_login_for_every_provider_spelling clicking_an_inactive_login_requests_the_account_switch connected_accounts_paint_in_the_sidebar
+        run: cargo test --manifest-path jcode-desktop/Cargo.toml -p jcode-desktop-ui -- accounts::tests:: panel::account::tests:: panel::usage::tests:: connected_accounts_paint_in_the_sidebar accounts_sidebar_groups_all_supported_states_and_refreshes accounts_oauth_history_renders_named_periods_and_unavailable_state accounts_fill_tab_with_mixed_quota_details accounts_scroll_independently_and_prioritize_active accounts_show_each_login_with_all_of_its_own_limits clicking_an_inactive_login_requests_the_account_switch
 
       - name: Build Windows package
         shell: pwsh
