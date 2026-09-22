@@ -530,8 +530,17 @@ fn usage_provider_matches(account: &Account, provider_name: &str) -> bool {
         "openai-api" => name.starts_with("openai api"),
         "jcode" => name.starts_with("jcode subscription"),
         id => {
-            let id = id.replace(['-', '_'], " ");
-            name == id || name.starts_with(&format!("{id} "))
+            // The id and the human name diverge for punctuated vendors (`zai`
+            // vs "Z.AI", `gemini` vs "Google Gemini"), so accept either. The
+            // usage report only ever prints the human name.
+            let from_id = id.replace(['-', '_'], " ");
+            let from_name = account.display_name.to_ascii_lowercase();
+            let matches = |candidate: &str| {
+                let candidate = candidate.trim();
+                !candidate.is_empty()
+                    && (name == candidate || name.starts_with(&format!("{candidate} ")))
+            };
+            matches(&from_id) || matches(&from_name)
         }
     }
 }
@@ -774,6 +783,36 @@ mod tests {
         assert_eq!(accounts[0].usage_reports[0].extra_info.len(), 2);
         assert_eq!(accounts[0].status_detail(), "Connected");
         assert_eq!(accounts[0].switch_provider(), None);
+    }
+
+    /// Punctuated vendors spell their id and their display name differently,
+    /// and the usage report only ever prints the display name.
+    #[test]
+    fn usage_reports_match_a_provider_by_id_or_display_name() {
+        let mut accounts = parse(
+            r#"{"providers":[
+            {"id":"zai","display_name":"Z.AI","status":"available","auth_kind":"API key"},
+            {"id":"gemini","display_name":"Google Gemini","status":"available","auth_kind":"OAuth"},
+            {"id":"openrouter","display_name":"OpenRouter","status":"available","auth_kind":"API key"}
+        ]}"#,
+        )
+        .unwrap();
+        merge_usage(
+            &mut accounts,
+            r#"{"providers":[
+            {"provider_name":"Z.AI (API key)","extra_info":[["Key status","active"]]},
+            {"provider_name":"Google Gemini","extra_info":[["Last used","1h ago"]]},
+            {"provider_name":"OpenRouter","extra_info":[["Local spend (this machine)","$0.30"]]}
+        ]}"#,
+        );
+        for id in ["zai", "gemini", "openrouter"] {
+            let account = accounts.iter().find(|a| a.id == id).unwrap();
+            assert_eq!(
+                account.usage_reports.len(),
+                1,
+                "{id} should receive exactly its own report"
+            );
+        }
     }
 
     #[test]
