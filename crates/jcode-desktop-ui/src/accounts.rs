@@ -53,6 +53,84 @@ impl UsageReport {
             None => self.provider_name.clone(),
         }
     }
+
+    /// The CLI marks its active OAuth login with a trailing ✦.
+    pub fn is_active(&self) -> bool {
+        self.provider_name.trim_end().ends_with('✦')
+    }
+
+    /// The login's own name, never the vendor: `claude-fox`, `personal`, ...
+    /// OpenAI reports it separately as the `Account label` extra_info, which is
+    /// authoritative when the provider name carries only a masked address.
+    pub fn login_label(&self) -> Option<String> {
+        let parsed = parse_report_name(&self.provider_name).0;
+        if !parsed.is_empty() {
+            return Some(parsed);
+        }
+        self.account_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// The masked address the CLI prints, e.g. `s***k@gmail.com`.
+    pub fn masked_email(&self) -> Option<String> {
+        parse_report_name(&self.provider_name).1
+    }
+
+    /// One readable line identifying this login, falling back to whatever the
+    /// CLI did print rather than rendering an empty heading.
+    pub fn heading(&self) -> String {
+        match (self.login_label(), self.masked_email()) {
+            (Some(label), Some(email)) => format!("{label} · {email}"),
+            (Some(label), None) => label,
+            (None, Some(email)) => email,
+            (None, None) => self.provider_name.trim_end_matches('✦').trim().to_owned(),
+        }
+    }
+}
+
+/// Split `Anthropic - claude-fox (s***k@gmail.com) ✦` into its login label,
+/// masked email, and active marker. The usage schema has no structured fields
+/// for these, so the display string is the only source.
+pub fn parse_report_name(provider_name: &str) -> (String, Option<String>, bool) {
+    let trimmed = provider_name.trim();
+    let (body, active) = match trimmed.strip_suffix('✦') {
+        Some(body) => (body.trim_end(), true),
+        None => (trimmed, false),
+    };
+    // The masked address is always the final parenthesized group, so a product
+    // name like "(ChatGPT)" is never mistaken for one.
+    let mut email = None;
+    let mut body = body;
+    if body.ends_with(')')
+        && let Some(open) = body.rfind('(')
+    {
+        // `)` is one ASCII byte, so this slice is always on a char boundary.
+        let inner = body[open + 1..body.len() - 1].trim();
+        if inner.contains('@') {
+            email = Some(inner.to_owned());
+            body = body[..open].trim_end();
+        }
+    }
+    (strip_provider_prefix(body), email, active)
+}
+
+/// Drop the vendor prefix the usage report repeats on every row, keeping only
+/// the part that distinguishes one login from another.
+fn strip_provider_prefix(body: &str) -> String {
+    if let Some((_, rest)) = body.split_once(" - ") {
+        return rest.trim().to_owned();
+    }
+    // "OpenAI (ChatGPT) personal" and "Z.AI (API key)": drop the vendor and its
+    // parenthesized product name, keeping any trailing login label.
+    if let Some(open) = body.find('(')
+        && let Some(close) = body[open..].find(')')
+    {
+        return body[open + close + 1..].trim().to_owned();
+    }
+    String::new()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,7 +147,7 @@ impl Account {
         let active: Vec<_> = self
             .usage_reports
             .iter()
-            .filter(|report| report.provider_name.trim_end().ends_with('✦'))
+            .filter(|report| report.is_active())
             .collect();
         match active.as_slice() {
             [report] => Some(&report.limits),
@@ -80,6 +158,36 @@ impl Account {
             },
             _ => None,
         }
+    }
+
+    /// Per-login order for rendering: the active login first, then CLI order.
+    pub fn ordered_reports(&self) -> Vec<(usize, &UsageReport)> {
+        let mut reports: Vec<_> = self.usage_reports.iter().enumerate().collect();
+        reports.sort_by_key(|(index, report)| (!report.is_active(), *index));
+        reports
+    }
+
+    /// Keep `limits` a summary of one login, never a blend of several. An
+    /// ambiguous multi-login provider reports nothing rather than the wrong
+    /// account's quota.
+    fn refresh_summary_limits(&mut self) {
+        let active: Vec<usize> = self
+            .usage_reports
+            .iter()
+            .enumerate()
+            .filter(|(_, report)| report.is_active())
+            .map(|(index, _)| index)
+            .collect();
+        // Exactly one login is marked active: it owns the summary. Without any
+        // marker, only a single login is unambiguous.
+        let summary = match (active.as_slice(), self.usage_reports.len()) {
+            ([index], _) => Some(*index),
+            ([], 1) => Some(0),
+            _ => None,
+        };
+        self.limits = summary
+            .map(|index| self.usage_reports[index].limits.clone())
+            .unwrap_or_default();
     }
 
     pub fn available(&self) -> bool {
@@ -104,17 +212,66 @@ impl Account {
     pub fn shows_oauth_history(&self) -> bool {
         self.id == "openai" && self.status != "not_configured"
     }
+
+    /// Any provider whose usage report is per-login gets the breakdown, not
+    /// just OpenAI: two Claude OAuth logins must never collapse into one row.
+    pub fn shows_login_breakdown(&self) -> bool {
+        self.status != "not_configured"
+            && (self.usage_reports.len() > 1
+                || self
+                    .usage_reports
+                    .iter()
+                    .any(|report| !report.limits.is_empty() || !report.extra_info.is_empty()))
+    }
+
+    /// True when the row renders sub-blocks and therefore grows past the
+    /// compact fixed height.
+    pub fn expands(&self) -> bool {
+        self.shows_oauth_history() || self.shows_login_breakdown()
+    }
+
+    /// The status line, which must say how many logins a provider holds.
+    pub fn status_detail(&self) -> String {
+        let label = self.status_label();
+        if self.usage_reports.len() > 1 {
+            format!("{label} · {} accounts", self.usage_reports.len())
+        } else {
+            label.to_owned()
+        }
+    }
+
+    /// The runtime's account-switch vocabulary, for providers that have one.
+    pub fn switch_provider(&self) -> Option<&'static str> {
+        match self.id.as_str() {
+            "claude" => Some("claude"),
+            "openai" => Some("openai"),
+            _ => None,
+        }
+    }
 }
 
 /// Resolve the credential, not the model family (Claude can use OpenRouter).
+/// The runtime spells the same credential several ways (`Claude`, `anthropic`,
+/// `claude-oauth`), so fold every spelling onto the account id the UI keys on.
 pub fn credential_id(provider: &str, auth: Option<&str>) -> String {
-    let api_key = auth == Some("api key");
-    match provider {
-        "anthropic" if api_key => "anthropic-api",
-        "anthropic" | "claude-cli" => "claude",
-        "openai" if api_key => "openai-api",
-        "gemini" if api_key => "gemini-api",
-        other => other,
+    let auth = auth.map(str::to_ascii_lowercase);
+    let api_key = auth.as_deref().is_some_and(|auth| auth.contains("api"));
+    let provider = provider.trim().to_ascii_lowercase();
+    match provider.as_str() {
+        "anthropic" | "claude" | "claude-oauth" | "claude-cli" | "anthropic-oauth" => {
+            if api_key { "anthropic-api" } else { "claude" }
+        }
+        "anthropic-api" | "anthropic-api-key" | "claude-api" => "anthropic-api",
+        "openai" | "chatgpt" | "openai-oauth" => {
+            if api_key { "openai-api" } else { "openai" }
+        }
+        "openai-api" | "openai-api-key" => "openai-api",
+        "gemini" | "google" | "gemini-oauth" => {
+            if api_key { "gemini-api" } else { "gemini" }
+        }
+        "gemini-api" | "gemini-api-key" => "gemini-api",
+        "zai" | "z.ai" | "zhipu" => "zai",
+        _ => return provider,
     }
     .to_owned()
 }
@@ -295,6 +452,7 @@ fn merge_usage(accounts: &mut [Account], json: &str) {
         return;
     };
 
+    let mut touched: Vec<usize> = Vec::new();
     for provider in providers {
         let Some(provider_name) = provider
             .get("provider_name")
@@ -302,12 +460,16 @@ fn merge_usage(accounts: &mut [Account], json: &str) {
         else {
             continue;
         };
-        let Some(account) = accounts
-            .iter_mut()
-            .find(|account| usage_provider_matches(account, provider_name))
+        let Some(index) = accounts
+            .iter()
+            .position(|account| usage_provider_matches(account, provider_name))
         else {
             continue;
         };
+        let account = &mut accounts[index];
+        if !touched.contains(&index) {
+            touched.push(index);
+        }
         let extra_info: Vec<(String, String)> = provider
             .get("extra_info")
             .and_then(|value| value.as_array())
@@ -350,8 +512,12 @@ fn merge_usage(accounts: &mut [Account], json: &str) {
                 })
             })
             .collect();
-        account.usage_reports.last_mut().unwrap().limits = limits.clone();
-        account.limits.extend(limits);
+        account.usage_reports.last_mut().unwrap().limits = limits;
+    }
+    // `limits` is a single-login summary for the compact row and the footer.
+    // Concatenating two logins' quotas produced the mislabeled six-limit row.
+    for index in touched {
+        accounts[index].refresh_summary_limits();
     }
 }
 
@@ -452,6 +618,162 @@ mod tests {
         assert_eq!(credential_id("openai", Some("api key")), "openai-api");
         assert_eq!(credential_id("openai", Some("oauth")), "openai");
         assert_eq!(credential_id("openrouter", None), "openrouter");
+    }
+
+    /// The runtime names the same credential several ways. The footer looked
+    /// up "Claude" and found nothing, so it always said "Limits —".
+    #[test]
+    fn credential_identity_folds_every_runtime_spelling_of_a_provider() {
+        for provider in ["Claude", "claude", "anthropic", "Anthropic", "claude-oauth"] {
+            assert_eq!(
+                credential_id(provider, Some("oauth")),
+                "claude",
+                "{provider} is the Claude subscription"
+            );
+        }
+        assert_eq!(credential_id("claude-cli", None), "claude");
+        assert_eq!(credential_id("Claude", Some("api key")), "anthropic-api");
+        assert_eq!(credential_id("anthropic-api-key", None), "anthropic-api");
+        for provider in ["OpenAI", "chatgpt", "openai-oauth"] {
+            assert_eq!(credential_id(provider, Some("oauth")), "openai");
+        }
+        assert_eq!(credential_id("ChatGPT", Some("api key")), "openai-api");
+        assert_eq!(credential_id("Gemini", Some("oauth")), "gemini");
+        assert_eq!(credential_id("gemini", Some("api key")), "gemini-api");
+        assert_eq!(credential_id("Z.AI", None), "zai");
+        assert_eq!(credential_id("zhipu", None), "zai");
+        assert_eq!(credential_id("OpenRouter", None), "openrouter");
+    }
+
+    /// The sub-block heading has to name the login, not repeat the vendor.
+    #[test]
+    fn report_names_split_into_login_label_masked_email_and_active_marker() {
+        for (name, label, email, active) in [
+            (
+                "Anthropic - claude-fox (s***k@gmail.com) ✦",
+                Some("claude-fox"),
+                Some("s***k@gmail.com"),
+                true,
+            ),
+            (
+                "Anthropic - claude-otter (a***h@gmail.com)",
+                Some("claude-otter"),
+                Some("a***h@gmail.com"),
+                false,
+            ),
+            (
+                "OpenAI (ChatGPT) (a***h@proton.me)",
+                None,
+                Some("a***h@proton.me"),
+                false,
+            ),
+            ("Z.AI (API key)", None, None, false),
+            ("Google Gemini", None, None, false),
+        ] {
+            let report = UsageReport {
+                provider_name: name.into(),
+                account_label: None,
+                limits: Vec::new(),
+                extra_info: Vec::new(),
+            };
+            assert_eq!(report.login_label().as_deref(), label, "label of {name}");
+            assert_eq!(report.masked_email().as_deref(), email, "email of {name}");
+            assert_eq!(report.is_active(), active, "active marker of {name}");
+            assert!(!report.heading().is_empty(), "heading of {name}");
+        }
+        let labelled = UsageReport {
+            provider_name: "OpenAI (ChatGPT) (a***h@proton.me)".into(),
+            account_label: Some("openai-otter".into()),
+            limits: Vec::new(),
+            extra_info: Vec::new(),
+        };
+        assert_eq!(labelled.login_label().as_deref(), Some("openai-otter"));
+        assert_eq!(labelled.heading(), "openai-otter · a***h@proton.me");
+    }
+
+    /// The reported bug: two Claude logins were concatenated into one six-limit
+    /// row whose first two entries belonged to different accounts.
+    #[test]
+    fn two_logins_keep_separate_limits_and_never_concatenate() {
+        let mut accounts =
+            parse(r#"{"providers":[{"id":"claude","display_name":"Anthropic/Claude","status":"available","auth_kind":"OAuth"}]}"#)
+                .unwrap();
+        merge_usage(
+            &mut accounts,
+            r#"{"providers":[
+            {"provider_name":"Anthropic - claude-fox (s***k@gmail.com) ✦","limits":[
+                {"name":"5-hour window","usage_percent":3.0,"reset_in":"4h 29m"},
+                {"name":"7-day window","usage_percent":0.0,"reset_in":"2d 6h"},
+                {"name":"7-day Fable window","usage_percent":0.0,"reset_in":"2d 6h"}
+            ],"extra_info":[["Last used","just now"]]},
+            {"provider_name":"Anthropic - claude-otter (a***h@gmail.com)","limits":[
+                {"name":"5-hour window","usage_percent":62.0,"reset_in":"1h 59m"},
+                {"name":"7-day window","usage_percent":14.0,"reset_in":"5d 1h"},
+                {"name":"7-day Fable window","usage_percent":0.0,"reset_in":"5d 1h"}
+            ],"extra_info":[["Last used","28m ago"]]}
+        ]}"#,
+        );
+        let claude = &accounts[0];
+        assert_eq!(claude.usage_reports.len(), 2);
+        assert_eq!(claude.usage_reports[0].limits.len(), 3);
+        assert_eq!(claude.usage_reports[1].limits.len(), 3);
+        assert_eq!(
+            claude.limits.len(),
+            3,
+            "the summary must describe one login, not six blended limits"
+        );
+        assert_eq!(claude.limits[0].usage_percent, 3.0);
+        assert_eq!(claude.active_limits().unwrap()[0].usage_percent, 3.0);
+        assert!(claude.shows_login_breakdown());
+        assert!(claude.expands());
+        assert_eq!(claude.status_detail(), "Signed in · 2 accounts");
+        let order: Vec<_> = claude
+            .ordered_reports()
+            .into_iter()
+            .map(|(index, report)| (index, report.login_label().unwrap()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![(0, "claude-fox".to_string()), (1, "claude-otter".to_string())],
+            "the active login leads the breakdown"
+        );
+        assert_eq!(claude.switch_provider(), Some("claude"));
+    }
+
+    /// An inactive second login must not let the footer show the wrong quota.
+    #[test]
+    fn ambiguous_multi_login_summary_is_empty_rather_than_wrong() {
+        let mut accounts =
+            parse(r#"{"providers":[{"id":"claude","status":"available"}]}"#).unwrap();
+        merge_usage(
+            &mut accounts,
+            r#"{"providers":[
+            {"provider_name":"Anthropic - one","limits":[{"name":"5 hour","usage_percent":10.0}]},
+            {"provider_name":"Anthropic - two","limits":[{"name":"5 hour","usage_percent":90.0}]}
+        ]}"#,
+        );
+        assert!(accounts[0].limits.is_empty());
+        assert!(accounts[0].active_limits().is_none());
+    }
+
+    /// API-key providers report spend rather than quotas, and that is still
+    /// worth showing under the provider header.
+    #[test]
+    fn api_key_providers_with_only_extra_info_still_get_a_breakdown() {
+        let mut accounts =
+            parse(r#"{"providers":[{"id":"zai","display_name":"Z.AI","status":"available","auth_kind":"API key"}]}"#)
+                .unwrap();
+        merge_usage(
+            &mut accounts,
+            r#"{"providers":[{"provider_name":"Z.AI (API key)","extra_info":[
+                ["Key status","active"],["Local spend (this machine)","$1.20"]
+            ]}]}"#,
+        );
+        assert!(accounts[0].shows_login_breakdown());
+        assert!(accounts[0].limits.is_empty());
+        assert_eq!(accounts[0].usage_reports[0].extra_info.len(), 2);
+        assert_eq!(accounts[0].status_detail(), "Connected");
+        assert_eq!(accounts[0].switch_provider(), None);
     }
 
     #[test]
@@ -710,15 +1032,19 @@ mod tests {
             .unwrap();
         assert_eq!(
             openai
-                .limits
+                .usage_reports
                 .iter()
-                .map(|limit| limit.name.as_str())
+                .map(|report| report.limits.len())
                 .collect::<Vec<_>>(),
-            ["5 hour", "Weekly"],
-            "valid limits from duplicate credential reports accumulate"
+            [1, 0, 1],
+            "each credential report keeps only its own valid limits"
         );
-        assert_eq!(openai.limits[0].usage_percent, 120.0);
-        assert_eq!(openai.limits[0].reset_in, None);
+        assert_eq!(openai.usage_reports[0].limits[0].usage_percent, 120.0);
+        assert_eq!(openai.usage_reports[0].limits[0].reset_in, None);
+        assert!(
+            openai.limits.is_empty(),
+            "limits from unrelated reports must never be concatenated"
+        );
         assert!(
             accounts
                 .iter()
