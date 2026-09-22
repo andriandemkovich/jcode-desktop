@@ -46,10 +46,14 @@ jobs:
         shell: pwsh
         run: cargo test --manifest-path jcode-desktop/Cargo.toml -p jcode-desktop-ui -- tab_minimize_window_sits_beside_close_and_keeps_the_workspace tab_close_window_is_separate_from_new_session_and_dispatches_host_action
 
+      - name: Test Desktop accounts panel
+        shell: pwsh
+        run: cargo test --manifest-path jcode-desktop/Cargo.toml -p jcode-desktop-ui -- accounts panel_usage account_switch footer_finds_the_active_claude_login_for_every_provider_spelling clicking_an_inactive_login_requests_the_account_switch connected_accounts_paint_in_the_sidebar
+
       - name: Build Windows package
         shell: pwsh
         env:
-          VERSION: 0.3.1-historyfix.3
+          VERSION: 0.3.1-historyfix.4
           JCODE_REPO: ${{ github.workspace }}/jcode
           TARGET: x86_64-pc-windows-msvc
         run: ./jcode-desktop/scripts/package-windows.ps1
