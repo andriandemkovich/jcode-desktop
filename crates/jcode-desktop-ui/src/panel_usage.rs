@@ -80,11 +80,12 @@ fn active_limits<'a>(
     auth: Option<&str>,
 ) -> Option<&'a [UsageLimit]> {
     let provider = provider?;
-    // Runtime identity arrives asynchronously. Ambiguous auth is not OAuth.
-    if auth.is_none() && matches!(provider, "openai" | "anthropic" | "gemini") {
+    let id = crate::accounts::credential_id(provider, auth);
+    // Runtime identity arrives asynchronously. Ambiguous auth is not OAuth for
+    // the providers that expose both a subscription and an API key.
+    if auth.is_none() && matches!(id.as_str(), "openai" | "claude" | "gemini") {
         return None;
     }
-    let id = crate::accounts::credential_id(provider, auth);
     accounts
         .iter()
         .find(|account| account.id == id)
@@ -223,6 +224,73 @@ mod tests {
         );
         assert!(active_limits(&accounts, Some("openai"), None).is_none());
         assert!(active_limits(&accounts, None, None).is_none());
+    }
+
+    /// The footer showed "Limits —" for Claude because the runtime reports its
+    /// provider as `Claude`, which the old lookup never mapped to the `claude`
+    /// account. The active login's meters must appear instead.
+    #[gpui::test]
+    fn footer_finds_the_active_claude_login_for_every_provider_spelling(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let mut accounts = crate::accounts::parse(
+                r#"{"providers":[{"id":"claude","display_name":"Anthropic/Claude","status":"available","auth_kind":"OAuth"}]}"#,
+            )
+            .unwrap();
+            let login = |name: &str, percent: f32| crate::accounts::UsageReport {
+                provider_name: name.into(),
+                account_label: None,
+                limits: vec![
+                    UsageLimit {
+                        name: "5-hour window".into(),
+                        usage_percent: percent,
+                        reset_in: Some("4h 29m".into()),
+                    },
+                    UsageLimit {
+                        name: "7-day window".into(),
+                        usage_percent: percent / 2.,
+                        reset_in: Some("2d 6h".into()),
+                    },
+                ],
+                extra_info: Vec::new(),
+            };
+            accounts[0].usage_reports = vec![
+                login("Anthropic - claude-fox (s***k@gmail.com) ✦", 3.),
+                login("Anthropic - claude-otter (a***h@gmail.com)", 62.),
+            ];
+            accounts[0].limits = accounts[0].usage_reports[0].limits.clone();
+            cx.set_global(StatusAccounts(accounts));
+        });
+        let (workspace, vcx) = cx.add_window_view(|_, cx| {
+            let mut workspace =
+                crate::workspace::Workspace::for_test(crate::learning::Coach::new(), cx);
+            workspace.push_test_panel("claude-session", cx);
+            workspace
+        });
+        let panel = workspace.read_with(vcx, |workspace, _| workspace.test_panel(0).unwrap());
+        for provider in ["Claude", "claude", "anthropic", "claude-oauth"] {
+            panel.update(vcx, |panel, cx| {
+                panel.provider = Some(provider.into());
+                panel.auth_method = Some("oauth".into());
+                panel.model = Some("claude-opus-5".into());
+                cx.notify();
+            });
+            vcx.run_until_parked();
+            assert!(
+                vcx.debug_bounds("panel-limits-unavailable").is_none(),
+                "{provider} should resolve to the Claude subscription"
+            );
+            for selector in ["panel-limit-0", "panel-limit-1"] {
+                assert!(
+                    vcx.debug_bounds(selector).is_some(),
+                    "{provider}: {selector} should paint the active login's quota"
+                );
+            }
+            // The inactive login's 62% must never reach the footer, so only two
+            // meters exist rather than the four a concatenation would produce.
+            assert!(vcx.debug_bounds("panel-limit-2").is_none());
+        }
     }
 
     #[gpui::test]
