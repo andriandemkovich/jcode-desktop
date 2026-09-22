@@ -27,6 +27,9 @@ use crate::todoist::{CreateTask, Project as TodoistProject, Task as TodoistTask,
 #[path = "panel_background_task.rs"]
 mod background_task;
 
+#[path = "panel_account.rs"]
+mod account;
+pub(crate) use account::switched_message as account_switched_message;
 #[path = "panel_activity.rs"]
 mod activity;
 #[path = "panel_scroll_motion.rs"]
@@ -2211,13 +2214,25 @@ impl Panel {
                         if let Some(panel) = weak.upgrade() {
                             // Login owns a separate, transient panel just like the
                             // Accounts footer. Never cover the source conversation.
-                            if images.is_empty()
-                                && content.split_whitespace().next() == Some("/login")
-                            {
+                            // Bare `/account` opens the same surface: Desktop used
+                            // to answer it with "not available yet" even though the
+                            // accounts UI was right there.
+                            let opens_accounts = images.is_empty()
+                                && match content.split_whitespace().next() {
+                                    Some("/login") => true,
+                                    Some("/account") | Some("/accounts") => matches!(
+                                        account::parse_account_command(&content),
+                                        Some(Ok(account::AccountRequest::Open))
+                                    ),
+                                    _ => false,
+                                };
+                            if opens_accounts {
                                 _window.dispatch_action(
                                     Box::new(crate::workspace::OpenAccounts {
                                         source: panel.entity_id(),
-                                        login_command: Some(content),
+                                        login_command: content
+                                            .starts_with("/login")
+                                            .then_some(content),
                                     }),
                                     app,
                                 );
@@ -2361,6 +2376,12 @@ impl Panel {
         }
         let trimmed = content.trim();
         if self.login_command(trimmed, cx) {
+            return true;
+        }
+        if self.account_command(trimmed, cx) {
+            self.stick_to_bottom = true;
+            self.transcript_list.scroll_to_end();
+            cx.notify();
             return true;
         }
         if let Some(model) = trimmed

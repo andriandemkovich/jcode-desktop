@@ -107,6 +107,13 @@ pub enum Update {
         session_id: String,
         reason: String,
     },
+    /// A provider's active OAuth login changed, in reply to
+    /// `Command::SwitchAccount`.
+    AccountSwitched {
+        session_id: String,
+        provider: String,
+        label: String,
+    },
     /// A per-session connection died.
     SessionLost {
         session_id: String,
@@ -164,6 +171,16 @@ pub enum Command {
         session_id: String,
         model: String,
     },
+    /// Change which stored OAuth login a provider spends. The credential is
+    /// global rather than per-session, so this rides any live connection.
+    SwitchAccount {
+        /// `claude` or `openai`, the runtime's switchable credential ids.
+        provider: String,
+        /// The account store's label, e.g. `claude-otter`.
+        label: String,
+        /// Session whose panel reports the outcome.
+        session_id: String,
+    },
     SessionOperation {
         session_id: String,
         operation: SessionOperation,
@@ -195,6 +212,10 @@ enum SessionCommand {
     Cancel,
     Fork,
     SetModel(String),
+    SwitchAccount {
+        provider: String,
+        label: String,
+    },
     Operation(SessionOperation),
     Stop,
 }
@@ -318,6 +339,34 @@ fn connect(client_name: &str) -> jcode_sdk::Result<JcodeClient> {
         ensure_runtime: false,
         ..Default::default()
     })
+}
+
+/// Point a provider at one of its stored OAuth logins.
+///
+/// The account store is the same owner-only file the CLI and TUI write, so the
+/// choice persists across restarts. `notify_auth_changed` then makes the live
+/// runtime reload credentials instead of spending the previous login until it
+/// happens to restart. No token material travels over the socket.
+fn switch_account(client: &JcodeClient, provider: &str, label: &str) -> Result<(), String> {
+    let stored = match provider {
+        "claude" => jcode_base::auth::claude::set_active_account(label),
+        "openai" => jcode_base::auth::codex::set_active_account(label),
+        other => {
+            return Err(format!(
+                "Switching accounts is not supported for `{other}`. Use /login to connect it."
+            ));
+        }
+    };
+    if let Err(error) = stored {
+        return Err(format!("Failed to switch account: {error}"));
+    }
+    jcode_base::auth::AuthStatus::invalidate_cache();
+    // A reload failure leaves the stored choice correct but the running
+    // runtime stale, which the user must know about rather than discover as a
+    // surprise bill on the previous account.
+    client
+        .notify_auth_changed(provider)
+        .map_err(|error| format!("Switched the stored account, but the runtime kept the previous credentials: {error}"))
 }
 
 /// Gracefully detach idle attachments, including from older runtimes that use
@@ -546,6 +595,16 @@ fn run_with_transports(
             }
             Command::SetModel { session_id, model } => {
                 let command = SessionCommand::SetModel(model);
+                send_to_session_worker(&mut workers, session_id, command, |session_id| {
+                    spawn_session_worker(session_id, &updates, &transports)
+                });
+            }
+            Command::SwitchAccount {
+                provider,
+                label,
+                session_id,
+            } => {
+                let command = SessionCommand::SwitchAccount { provider, label };
                 send_to_session_worker(&mut workers, session_id, command, |session_id| {
                     spawn_session_worker(session_id, &updates, &transports)
                 });
@@ -1430,6 +1489,42 @@ fn session_worker_with_connector(
                                 session_id: session_id.clone(),
                                 reason: format!("Failed to switch model: {error}"),
                             });
+                        }
+                    }
+                    SessionCommand::SwitchAccount { provider, label } => {
+                        match switch_account(&client, &provider, &label) {
+                            Ok(()) => {
+                                // The sidebar and the footer both read the
+                                // account feed, so refresh it now instead of
+                                // waiting out the slow poll.
+                                crate::accounts::request_refresh();
+                                let _ = updates.send(Update::AccountSwitched {
+                                    session_id: session_id.clone(),
+                                    provider,
+                                    label,
+                                });
+                                // Identity in the footer is per-session state
+                                // the runtime re-reports after a credential
+                                // change.
+                                if let Ok(info) = client.get_runtime_info(real_id) {
+                                    let _ = updates.send(Update::Event {
+                                        session_id: session_id.clone(),
+                                        event: ApiEvent::RuntimeInfo {
+                                            session_id: session_id.clone(),
+                                            provider: info.provider,
+                                            model: info.model,
+                                            routes: info.routes,
+                                            reasoning_effort: info.reasoning_effort,
+                                        },
+                                    });
+                                }
+                            }
+                            Err(reason) => {
+                                let _ = updates.send(Update::CommandFailed {
+                                    session_id: session_id.clone(),
+                                    reason,
+                                });
+                            }
                         }
                     }
                     SessionCommand::Operation(operation) => {

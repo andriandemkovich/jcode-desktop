@@ -1999,6 +1999,26 @@ impl Workspace {
                 self.connected = false;
                 self.status = format!("disconnected: {reason} (retrying)");
             }
+            Update::AccountSwitched {
+                session_id,
+                provider,
+                label,
+            } => {
+                // The account feed already refreshed, so the sidebar and every
+                // footer follow on their own. Only the panel that asked reports
+                // the change in its transcript.
+                for slot in &self.slots {
+                    if slot.panel.read(cx).session_id == session_id {
+                        slot.panel.update(cx, |panel, cx| {
+                            panel.items.push(crate::panel::Item::Assistant(
+                                crate::panel::account_switched_message(&provider, &label),
+                            ));
+                            cx.notify();
+                        });
+                        break;
+                    }
+                }
+            }
             Update::SessionLost { session_id, reason } => {
                 self.set_cloud_transport_connected(&session_id, false);
                 if let Some(host) = harness::remote_host(&session_id) {
@@ -2777,6 +2797,34 @@ impl Workspace {
         self.set_active(insert_at, cx);
         self.retarget_camera();
         self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// Point a provider at another of its stored logins, from the sidebar.
+    ///
+    /// The credential is global, so the request only needs some live session
+    /// to carry it; the active panel is the one that reports the outcome.
+    pub(crate) fn switch_account(
+        &mut self,
+        provider: String,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_id) = self
+            .slots
+            .get(self.active)
+            .or_else(|| self.slots.first())
+            .map(|slot| slot.panel.read(cx).session_id.clone())
+        else {
+            self.status = "Open a session before switching accounts.".into();
+            cx.notify();
+            return;
+        };
+        self.bridge.send(Command::SwitchAccount {
+            provider,
+            label,
+            session_id,
+        });
         cx.notify();
     }
 
@@ -5778,10 +5826,11 @@ impl Workspace {
                         } else {
                             Theme::global().TEXT_DIM
                         })
-                        .child(account.status_label()),
+                        .child(account.status_detail()),
                 );
 
-            if available && !account.limits.is_empty() {
+            let breakdown = account.shows_login_breakdown();
+            if available && !breakdown && !account.limits.is_empty() {
                 // A single two-column quota row retains the useful summary
                 // without letting one account grow into a card.
                 let limit_count = if account.id == "antigravity" {
@@ -5849,7 +5898,8 @@ impl Workspace {
                 details = details.child(limits);
             }
 
-            if account.shows_oauth_history() {
+            let openai_history = account.shows_oauth_history();
+            if breakdown || openai_history {
                 let mut history = div()
                     .debug_selector(|| format!("account-{}-history", account.id))
                     .mt_2()
@@ -5859,56 +5909,196 @@ impl Workspace {
                     .text_size(px(10.0))
                     .line_height(px(15.0))
                     .text_color(Theme::global().TEXT_DIM);
-                if account.usage_reports.is_empty() {
+                if openai_history && account.usage_reports.is_empty() {
                     history = history.child(
                         div()
                             .debug_selector(|| "account-openai-history-unavailable".into())
                             .child("Today / Lifetime: usage history unavailable. No recorded usage has been received."),
                     );
                 }
-                for (report_index, report) in account.usage_reports.iter().enumerate() {
+                // One sub-block per login, active first. Nothing is summed or
+                // truncated across logins: the user must be able to tell whose
+                // quota each meter belongs to.
+                for (report_index, report) in account.ordered_reports() {
+                    let account_id = account.id.clone();
+                    // OpenAI keeps its historical selector; every other
+                    // provider gets the generic per-login one.
+                    let selector = if openai_history {
+                        format!("account-openai-history-report-{report_index}")
+                    } else {
+                        format!("account-{account_id}-login-{report_index}")
+                    };
+                    // Only an inactive login of a switchable provider is an
+                    // action. Clicking the current one would do nothing.
+                    let switch_to = account
+                        .switch_provider()
+                        .filter(|_| !report.is_active())
+                        .zip(report.login_label())
+                        .map(|(provider, label)| (provider.to_owned(), label));
                     let mut report_view = div()
-                        .debug_selector(move || {
-                            format!("account-openai-history-report-{report_index}")
+                        .id(("account-login", index * 100 + report_index))
+                        .debug_selector(move || selector.clone())
+                        .when_some(switch_to.clone(), |block, (provider, label)| {
+                            block
+                                .cursor_pointer()
+                                .rounded_sm()
+                                .hover(|el| el.bg(Theme::global().INLINE_CODE_BG))
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(move |this, _event, _window, cx| {
+                                        this.switch_account(
+                                            provider.clone(),
+                                            label.clone(),
+                                            cx,
+                                        );
+                                    }),
+                                )
                         })
                         .flex()
                         .flex_col()
-                        .gap_1()
-                        .child(div().text_color(ink).child(report.title()));
-                    for period in ["Today", "Lifetime"] {
-                        let value = report
-                            .extra_info
-                            .iter()
-                            .find(|(key, _)| key == period)
-                            .map(|(_, value)| value.as_str())
-                            .unwrap_or("Usage history unavailable");
+                        .gap_1();
+                    let heading = report.heading();
+                    report_view = report_view.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(ink)
+                                    .child(heading),
+                            )
+                            .when(report.is_active(), |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(8.0))
+                                        .text_color(Theme::global().ACCENT)
+                                        .child("active"),
+                                )
+                            })
+                            .when(switch_to.is_some(), |row| {
+                                row.child(
+                                    div()
+                                        .debug_selector({
+                                            let account_id = account_id.clone();
+                                            move || {
+                                                format!(
+                                                    "account-{account_id}-login-{report_index}-switch"
+                                                )
+                                            }
+                                        })
+                                        .flex_none()
+                                        .text_size(px(8.0))
+                                        .text_color(Theme::global().TEXT_FAINT)
+                                        .child("Switch"),
+                                )
+                            }),
+                    );
+                    // Every limit on its own full-width line, so the name, the
+                    // percentage and the reset all stay readable.
+                    for (limit_index, limit) in report.limits.iter().enumerate() {
+                        let used = limit.usage_percent.clamp(0.0, 100.0);
+                        let label = match &limit.reset_in {
+                            Some(reset) => {
+                                format!("{}  {used:.0}% · resets {reset}", limit.name)
+                            }
+                            None => format!("{}  {used:.0}%", limit.name),
+                        };
                         report_view = report_view.child(
                             div()
-                                .debug_selector(move || {
-                                    format!("account-openai-history-{report_index}-{period}")
+                                .debug_selector({
+                                    let account_id = account_id.clone();
+                                    move || {
+                                        format!(
+                                            "account-{account_id}-login-{report_index}-limit-{limit_index}"
+                                        )
+                                    }
                                 })
-                                .child(format!("{period}: {value}")),
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_size(px(9.0))
+                                        .line_height(px(13.0))
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(px(3.0))
+                                        .rounded_full()
+                                        .overflow_hidden()
+                                        .bg(Theme::global().INLINE_CODE_BG)
+                                        .child(
+                                            div()
+                                                .h_full()
+                                                .w(relative(used / 100.0))
+                                                .rounded_full()
+                                                .bg(if used >= 90.0 {
+                                                    Theme::global().ERROR
+                                                } else if used >= 70.0 {
+                                                    Theme::global().WARN
+                                                } else {
+                                                    Theme::global().ACCENT
+                                                }),
+                                        ),
+                                ),
                         );
                     }
-                    // Retain backend coverage, estimate and pricing caveats verbatim.
-                    for (key, value) in &report.extra_info {
-                        if !matches!(key.as_str(), "Today" | "Lifetime") {
-                            report_view = report_view.child(div().child(format!("{key}: {value}")));
+                    if openai_history {
+                        for period in ["Today", "Lifetime"] {
+                            let value = report
+                                .extra_info
+                                .iter()
+                                .find(|(key, _)| key == period)
+                                .map(|(_, value)| value.as_str())
+                                .unwrap_or("Usage history unavailable");
+                            report_view = report_view.child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("account-openai-history-{report_index}-{period}")
+                                    })
+                                    .child(format!("{period}: {value}")),
+                            );
                         }
+                    }
+                    // Retain backend coverage, estimate and pricing caveats
+                    // verbatim, and the plan/spend lines API-key providers
+                    // report instead of quotas.
+                    for (key, value) in &report.extra_info {
+                        if openai_history && matches!(key.as_str(), "Today" | "Lifetime") {
+                            continue;
+                        }
+                        report_view = report_view.child(
+                            div()
+                                .text_size(px(9.0))
+                                .line_height(px(13.0))
+                                .child(format!("{key}: {value}")),
+                        );
                     }
                     history = history.child(report_view);
                 }
-                details = details.child(history).child(
-                    div()
-                        .debug_selector(|| "account-openai-estimate-note".into())
-                        .mt_2()
-                        .text_size(px(9.0))
-                        .line_height(px(13.0))
-                        .text_color(Theme::global().TEXT_DIM)
-                        .child(accounts::USAGE_ESTIMATE_NOTE),
-                );
+                details = details.child(history);
+                if openai_history {
+                    details = details.child(
+                        div()
+                            .debug_selector(|| "account-openai-estimate-note".into())
+                            .mt_2()
+                            .text_size(px(9.0))
+                            .line_height(px(13.0))
+                            .text_color(Theme::global().TEXT_DIM)
+                            .child(accounts::USAGE_ESTIMATE_NOTE),
+                    );
+                }
             }
 
+            let expands = account.expands();
             list = list.child(
                 div()
                     .flex_none()
@@ -5916,18 +6106,14 @@ impl Workspace {
                     .debug_selector(|| format!("account-{}", account.id))
                     .mx_2()
                     .px_2()
-                    .when(account.shows_oauth_history(), |row| {
-                        row.min_h(px(ACCOUNT_ROW_HEIGHT))
-                    })
-                    .when(!account.shows_oauth_history(), |row| {
-                        row.h(px(ACCOUNT_ROW_HEIGHT))
-                    })
+                    .when(expands, |row| row.min_h(px(ACCOUNT_ROW_HEIGHT)))
+                    .when(!expands, |row| row.h(px(ACCOUNT_ROW_HEIGHT)))
                     .py_1()
                     .overflow_hidden()
                     .rounded_md()
                     .flex()
                     .items_center()
-                    .when(account.shows_oauth_history(), |row| row.items_start())
+                    .when(expands, |row| row.items_start())
                     .gap_2()
                     .hover(|el| el.bg(Theme::global().HEADER_BG))
                     .child(logo)
@@ -10119,6 +10305,148 @@ mod tests {
         assert!(
             today.right() <= row.right(),
             "long token details must wrap inside the sidebar"
+        );
+    }
+
+    /// Two Claude logins used to collapse into one row showing an arbitrary
+    /// two of their six concatenated limits, so the user could not tell whose
+    /// quota was on screen.
+    #[gpui::test]
+    fn accounts_show_each_login_with_all_of_its_own_limits(cx: &mut gpui::TestAppContext) {
+        let (workspace, vcx) =
+            cx.add_window_view(|_, cx| Workspace::for_test(learning::Coach::new(), cx));
+        workspace.update(vcx, |w, cx| {
+            w.sidebar_view = SidebarView::Accounts;
+            let mut accounts = accounts::parse(r#"{"providers":[{"id":"claude","display_name":"Anthropic/Claude","status":"available","auth_kind":"OAuth"}]}"#).unwrap();
+            let login = |name: &str, first: f32, second: f32, third: f32| accounts::UsageReport {
+                provider_name: name.into(),
+                account_label: None,
+                limits: [("5-hour window", first), ("7-day window", second), ("7-day Fable window", third)]
+                    .into_iter()
+                    .map(|(name, percent)| accounts::UsageLimit {
+                        name: name.into(),
+                        usage_percent: percent,
+                        reset_in: Some("4h 29m".into()),
+                    })
+                    .collect(),
+                extra_info: vec![("Last used".into(), "just now".into())],
+            };
+            accounts[0].usage_reports = vec![
+                login("Anthropic - claude-otter (a***h@gmail.com)", 62.0, 14.0, 0.0),
+                login("Anthropic - claude-fox (s***k@gmail.com) ✦", 3.0, 0.0, 0.0),
+            ];
+            accounts[0].limits = accounts[0].usage_reports[1].limits.clone();
+            w.set_test_accounts(accounts);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        let row = vcx.debug_bounds("account-claude").unwrap();
+        // The active login (index 1 in CLI order) leads the breakdown.
+        let active = vcx.debug_bounds("account-claude-login-1").unwrap();
+        let other = vcx.debug_bounds("account-claude-login-0").unwrap();
+        assert!(
+            active.bottom() <= other.top(),
+            "the active login must lead the breakdown"
+        );
+        assert!(row.size.height > px(ACCOUNT_ROW_HEIGHT));
+        for report in [0, 1] {
+            let lines: Vec<_> = (0..3)
+                .map(|limit| {
+                    let selector = Box::leak(
+                        format!("account-claude-login-{report}-limit-{limit}").into_boxed_str(),
+                    );
+                    vcx.debug_bounds(selector)
+                        .unwrap_or_else(|| panic!("{selector} should paint"))
+                })
+                .collect();
+            for (limit, bounds) in lines.iter().enumerate() {
+                assert!(
+                    bounds.right() <= row.right(),
+                    "login {report} limit {limit} must fit inside the sidebar row"
+                );
+            }
+            for pair in lines.windows(2) {
+                assert!(
+                    pair[0].bottom() <= pair[1].top(),
+                    "login {report}: each limit needs its own full-width line"
+                );
+            }
+        }
+        // The summary row is replaced by the breakdown, never shown alongside.
+        assert!(vcx.debug_bounds("account-claude-limit-0").is_none());
+        // Only the inactive login offers the switch affordance.
+        assert!(vcx.debug_bounds("account-claude-login-0-switch").is_some());
+        assert!(vcx.debug_bounds("account-claude-login-1-switch").is_none());
+    }
+
+    /// Clicking an inactive login must actually change the credential, not
+    /// merely highlight a row.
+    #[gpui::test]
+    fn clicking_an_inactive_login_requests_the_account_switch(cx: &mut gpui::TestAppContext) {
+        let (bridge, commands) = crate::harness::spawn_recording();
+        let (workspace, vcx) = cx.add_window_view(|_, cx| {
+            let mut workspace = Workspace::for_test(learning::Coach::new(), cx);
+            workspace.set_test_bridge(bridge);
+            workspace.push_test_panel("switching-session", cx);
+            workspace.sidebar_view = SidebarView::Accounts;
+            workspace
+        });
+        workspace.update(vcx, |w, cx| {
+            let mut accounts = accounts::parse(r#"{"providers":[{"id":"claude","display_name":"Anthropic/Claude","status":"available","auth_kind":"OAuth"}]}"#).unwrap();
+            accounts[0].usage_reports = [
+                "Anthropic - claude-fox (s***k@gmail.com) ✦",
+                "Anthropic - claude-otter (a***h@gmail.com)",
+            ]
+            .into_iter()
+            .map(|name| accounts::UsageReport {
+                provider_name: name.into(),
+                account_label: None,
+                limits: vec![accounts::UsageLimit {
+                    name: "5-hour window".into(),
+                    usage_percent: 10.0,
+                    reset_in: Some("2h".into()),
+                }],
+                extra_info: Vec::new(),
+            })
+            .collect();
+            w.set_test_accounts(accounts);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        // Drain the session refresh the workspace issues on startup.
+        while commands.try_recv().is_ok() {}
+        let inactive = vcx
+            .debug_bounds("account-claude-login-1")
+            .expect("the second login should paint");
+        vcx.simulate_click(inactive.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        let switched = std::iter::from_fn(|| commands.try_recv().ok()).find_map(|command| {
+            match command {
+                Command::SwitchAccount {
+                    provider,
+                    label,
+                    session_id,
+                } => Some((provider, label, session_id)),
+                _ => None,
+            }
+        });
+        assert_eq!(
+            switched,
+            Some((
+                "claude".to_string(),
+                "claude-otter".to_string(),
+                "switching-session".to_string()
+            )),
+            "clicking a non-active login switches to it"
+        );
+        // The active login is not an action, so clicking it sends nothing.
+        let active = vcx.debug_bounds("account-claude-login-0").unwrap();
+        vcx.simulate_click(active.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        assert!(
+            !std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, Command::SwitchAccount { .. })),
+            "the active login must not re-request its own credential"
         );
     }
 
